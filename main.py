@@ -1,10 +1,27 @@
 import argparse
+import hashlib
 import os
 import re
+import signal
 import logging
-import yara
-import magic
+import sys
 import pandas as pd
+
+# yara and python-magic are optional and are imported lazily, only when
+# the feature that needs them is requested, so a patterns-only scan runs
+# without either binding installed.
+
+SCAN_TIMEOUT_SECONDS = 5
+
+CATASTROPHIC_SHAPE = re.compile(r"\([^)]*[+*][^)]*\)\s*(?:\+|\*|\{)")
+
+
+class ScanTimeout(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise ScanTimeout("scan timed out")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,8 +51,29 @@ class SuspiciousStringLocator:
         self.context_lines = context_lines
         self.yara_rules_file = yara_rules_file
         self.patterns = self.load_patterns()
+        self.compiled_patterns = []
+        self.pattern_error = None
+        self.timed_out_files = []
+        self.files_scanned = 0
+        for pattern in self.patterns:
+            if CATASTROPHIC_SHAPE.search(pattern):
+                self.pattern_error = (
+                    f"Pattern refused (nested quantifiers can hang the scan): {pattern}")
+                break
+            try:
+                flags = re.IGNORECASE if self.case_insensitive else 0
+                label = f"pattern_{len(self.compiled_patterns) + 1}"
+                self.compiled_patterns.append((label, re.compile(pattern, flags)))
+            except re.error as e:
+                self.pattern_error = f"Invalid pattern {pattern!r}: {e}"
+                break
         self.yara_rules = self.load_yara_rules()
-        self.mime = magic.Magic(mime=True) #Initialize libmagic
+        self.mime = None
+        try:
+            import magic
+            self.mime = magic.Magic(mime=True)
+        except ImportError:
+            logging.warning("python-magic not available: scanning all files as text.")
 
     def load_patterns(self):
         """
@@ -64,6 +102,11 @@ class SuspiciousStringLocator:
             yara.Rules: Compiled YARA rules, or None if an error occurred.
         """
         if self.yara_rules_file:
+            try:
+                import yara
+            except ImportError:
+                logging.error("YARA rules were requested but yara-python is not installed.")
+                raise SystemExit(1)
             try:
                 rules = yara.compile(filepath=self.yara_rules_file)
                 logging.info(f"Successfully loaded YARA rules from {self.yara_rules_file}")
@@ -103,51 +146,26 @@ class SuspiciousStringLocator:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
 
-                # Scan for suspicious strings
-                for pattern in self.patterns:
-                    flags = re.IGNORECASE if self.case_insensitive else 0
-                    # Pattern lines are regular expressions, not literal strings, and
-                    # nothing in the loader warns about that. One invalid expression
-                    # raises out of this loop into the handler that returns an empty
-                    # list for the whole file, discarding matches earlier patterns
-                    # already found in it.
-                    for match in re.finditer(pattern, content, flags=flags):
+                # Scan for suspicious strings. Only a hash of each
+                # matched string is recorded: matched text and the
+                # surrounding lines are never written to the report.
+                for pattern, compiled in self.compiled_patterns:
+                    for match in compiled.finditer(content):
                         match_start = match.start()
                         match_end = match.end()
-
-                        start_line = content.rfind('\n', 0, match_start) + 1
-                        end_line = content.find('\n', match_end)
-                        if end_line == -1:
-                            end_line = len(content)
-
-                        # Extract context lines
-                        context_start = content.rfind('\n', 0, start_line) + 1
-                        for _ in range(self.context_lines - 1): # Extract previous context lines.
-                            context_start = content.rfind('\n', 0, context_start -1) + 1 # Subtract 1 because the find starts at the index
-                            if context_start < 1 :
-                                context_start = 0
-                                break
-                        
-                        context_end = content.find('\n', end_line)
-                        for _ in range(self.context_lines - 1): # Extract following context lines.
-                            context_end = content.find('\n', context_end + 1)
-                            if context_end == -1:
-                                context_end = len(content)
-                                break
-                        
-                        context = content[context_start:context_end] #Grab the context surrounding the matching line
+                        line_number = content.count("\n", 0, match_start) + 1
                         match_data = {
                             'file': filepath,
                             'pattern': pattern,
-                            'match': match.group(0),
+                            'line': line_number,
                             'start': match_start,
                             'end': match_end,
-                            'context': context.strip(),
-                            'type': 'string' #Added type
+                            'match_sha256': hashlib.sha256(match.group(0).encode("utf-8", "ignore")).hexdigest(),
+                            'type': 'string'
                         }
                         matches.append(match_data)
                         logging.debug(f"String Match found in {filepath}: {pattern}")
-                
+
                 # Scan with YARA rules
                 if self.yara_rules:
                     try:
@@ -155,14 +173,16 @@ class SuspiciousStringLocator:
                         for yara_match in yara_matches:
                             match_data = {
                                 'file': filepath,
-                                'rule': yara_match.rule,
-                                'namespace': yara_match.namespace,
-                                'matches': yara_match.strings, #added the matches from YARA
-                                'type': 'yara' #Added Type
+                                'pattern': yara_match.rule,
+                                'line': '',
+                                'start': '',
+                                'end': '',
+                                'match_sha256': hashlib.sha256(repr(yara_match.strings).encode("utf-8", "ignore")).hexdigest(),
+                                'type': 'yara'
                             }
                             matches.append(match_data)
                             logging.debug(f"YARA match found in {filepath}: {yara_match.rule}")
-                    except yara.Error as e:
+                    except Exception as e:
                         logging.error(f"YARA error during file scan: {filepath} - {e}")
 
             return matches
@@ -188,13 +208,26 @@ class SuspiciousStringLocator:
             for root, _, files in os.walk(self.directory):
                 for file in files:
                     filepath = os.path.join(root, file)
-                    mime_type = self.mime.from_file(filepath) #check mime type to avoid binary file scan
+                    mime_type = self.mime.from_file(filepath) if self.mime is not None else "text/plain" 
                     # This mime gate skips more than binaries: JSON, scripts served as
                     # application types, and anything libmagic names without the word
                     # text are never opened. The skip is logged at debug level only, so
                     # a default run gives no sign whole file classes were passed over.
                     if 'text' in mime_type or 'application/x-empty' in mime_type: #only scan text files and empty file
-                        all_matches.extend(self.scan_file(filepath))
+                        self.files_scanned += 1
+                        try:
+                            if hasattr(signal, "SIGALRM"):
+                                old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+                                signal.setitimer(signal.ITIMER_REAL, SCAN_TIMEOUT_SECONDS)
+                            try:
+                                all_matches.extend(self.scan_file(filepath))
+                            finally:
+                                if hasattr(signal, "SIGALRM"):
+                                    signal.setitimer(signal.ITIMER_REAL, 0)
+                                    signal.signal(signal.SIGALRM, old_handler)
+                        except ScanTimeout:
+                            logging.error(f"Scan of {filepath} exceeded {SCAN_TIMEOUT_SECONDS}s and was stopped.")
+                            self.timed_out_files.append(filepath)
                     else:
                         logging.debug(f"Skipping binary file {filepath} (MIME Type: {mime_type})") #Log skipped binary files
                 if not self.recursive:
@@ -265,19 +298,19 @@ def main():
     # are indistinguishable to anything watching the exit status.
     if not os.path.exists(args.patterns_file):
         logging.error(f"Patterns file not found: {args.patterns_file}")
-        return
+        sys.exit(1)
 
     if not os.path.exists(args.directory):
         logging.error(f"Directory not found: {args.directory}")
-        return
-    
+        sys.exit(1)
+
     if args.yara_rules_file and not os.path.exists(args.yara_rules_file):
          logging.error(f"YARA rules file not found: {args.yara_rules_file}")
-         return
+         sys.exit(1)
 
     if args.context_lines < 0:
         logging.error("Context lines must be a non-negative integer.")
-        return
+        sys.exit(1)
 
     locator = SuspiciousStringLocator(
         args.patterns_file,
@@ -288,7 +321,17 @@ def main():
         args.yara_rules_file
     )
 
+    if locator.pattern_error:
+        logging.error(locator.pattern_error)
+        sys.exit(1)
+
     matches = locator.scan_directory()
+    if locator.timed_out_files:
+        logging.error(f"Scan did not complete for {len(locator.timed_out_files)} file(s) (timeout).")
+        sys.exit(1)
+    if locator.files_scanned == 0:
+        logging.error("No files were scanned. No verdict was produced.")
+        sys.exit(1)
     locator.generate_report(matches, args.output_file)
 
 

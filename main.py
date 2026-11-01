@@ -96,12 +96,21 @@ class SuspiciousStringLocator:
         matches = []
 
         try:
+            # Decoding with errors ignored means the offsets in my match records
+            # count decoded characters, not file bytes, and YARA below is fed the
+            # decoded text rather than the bytes on disk. A pattern spanning a
+            # dropped byte sequence can never match.
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
 
                 # Scan for suspicious strings
                 for pattern in self.patterns:
                     flags = re.IGNORECASE if self.case_insensitive else 0
+                    # Pattern lines are regular expressions, not literal strings, and
+                    # nothing in the loader warns about that. One invalid expression
+                    # raises out of this loop into the handler that returns an empty
+                    # list for the whole file, discarding matches earlier patterns
+                    # already found in it.
                     for match in re.finditer(pattern, content, flags=flags):
                         match_start = match.start()
                         match_end = match.end()
@@ -180,6 +189,10 @@ class SuspiciousStringLocator:
                 for file in files:
                     filepath = os.path.join(root, file)
                     mime_type = self.mime.from_file(filepath) #check mime type to avoid binary file scan
+                    # This mime gate skips more than binaries: JSON, scripts served as
+                    # application types, and anything libmagic names without the word
+                    # text are never opened. The skip is logged at debug level only, so
+                    # a default run gives no sign whole file classes were passed over.
                     if 'text' in mime_type or 'application/x-empty' in mime_type: #only scan text files and empty file
                         all_matches.extend(self.scan_file(filepath))
                     else:
@@ -206,6 +219,9 @@ class SuspiciousStringLocator:
                 df.to_csv(output_file, index=False)
                 logging.info(f"Report generated successfully: {output_file}")
             else:
+                # No report file is written, which leaves a report.csv from an
+                # earlier run in place under the default output name. Anyone reading
+                # that file afterwards is reading a previous scan.
                 logging.info("No matches found. Report not generated.")
         except Exception as e:
             logging.error(f"Error generating report: {e}")
@@ -244,6 +260,9 @@ def main():
     args = parser.parse_args()
 
     # Input validation
+    # These validation failures return from main with no exit code, so
+    # the process ends 0. A missing patterns file and a completed scan
+    # are indistinguishable to anything watching the exit status.
     if not os.path.exists(args.patterns_file):
         logging.error(f"Patterns file not found: {args.patterns_file}")
         return
